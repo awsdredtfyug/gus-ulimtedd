@@ -1,0 +1,11 @@
+{
+  "name": "55GMS",
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "55GMS",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    }
+  }
+}
