@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>55GMS — index.js source</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #111827; color: #e5e7eb; }
+    body { margin: 0; }
+    header { position: sticky; top: 0; padding: 1rem 1.5rem; background: #1f2937; border-bottom: 1px solid #374151; }
+    h1 { margin: 0; font: 600 1rem system-ui, sans-serif; }
+    pre { margin: 0; padding: 1.5rem; overflow: auto; line-height: 1.55; tab-size: 2; }
+    code { font: inherit; }
+  </style>
+</head>
+<body>
+  <header><h1>55GMS — index.js</h1></header>
+  <pre><code>import express from &quot;express&quot;;
+import { createServer } from &quot;http&quot;;
+import { Server as SocketIO } from &quot;socket.io&quot;;
+import { createAdapter } from &quot;@socket.io/redis-adapter&quot;;
+import { createClient } from &quot;redis&quot;;
+import path from &quot;path&quot;;
+import { fileURLToPath } from &quot;url&quot;;
+import { dirname } from &quot;path&quot;;
+import cors from &quot;cors&quot;;
+import &quot;dotenv/config&quot;;
+import { Op } from &quot;sequelize&quot;;
+import { server as wisp, logging } from &quot;@mercuryworkshop/wisp-js/server&quot;;
+import { createCompression, staticOptions } from &quot;./utils/httpPerformance.js&quot;;
+
+import { mountProxyAssets } from &quot;./utils/proxyAssets.js&quot;;
+
+logging.set_level(logging.ERROR);
+
+import {
+  initDatabase,
+  UserStatus,
+  Chat,
+  Message,
+  ChatMember,
+} from &quot;./models/index.js&quot;;
+
+import authRoutes from &quot;./routes/auth.js&quot;;
+import userRoutes from &quot;./routes/users.js&quot;;
+import messagingRoutes from &quot;./routes/messaging.js&quot;;
+import searchRoutes from &quot;./routes/search.js&quot;;
+import proxyRoutes from &quot;./routes/music.js&quot;;
+import { startMessageRetention } from &quot;./services/messageRetention.js&quot;;
+
+try {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+
+  const app = express();
+  app.use(createCompression());
+  mountProxyAssets(app);
+  const server = createServer(app);
+
+  const io = new SocketIO({
+    cors: {
+      origin: &quot;*&quot;,
+      methods: [&quot;GET&quot;, &quot;POST&quot;],
+    },
+  });
+
+  io.attach(server);
+
+  let redisPubClient;
+  let redisSubClient;
+
+  async function configureSocketAdapter() {
+    if (!process.env.REDIS_URL) {
+      console.warn(
+        &quot;REDIS_URL is not set. Socket.IO will only coordinate within this Node process.&quot;,
+      );
+      return;
+    }
+
+    redisPubClient = createClient({ url: process.env.REDIS_URL });
+    redisSubClient = redisPubClient.duplicate();
+
+    redisPubClient.on(&quot;error&quot;, (error) =&gt; {
+      console.error(&quot;Redis pub client error:&quot;, error);
+    });
+    redisSubClient.on(&quot;error&quot;, (error) =&gt; {
+      console.error(&quot;Redis sub client error:&quot;, error);
+    });
+
+    await Promise.all([redisPubClient.connect(), redisSubClient.connect()]);
+    io.adapter(createAdapter(redisPubClient, redisSubClient));
+    console.log(&quot;✅ Socket.IO Redis adapter connected.&quot;);
+  }
+
+  async function hasOtherUserSocket(userUuid, currentSocketId) {
+    const sockets = await io.in(`user_${userUuid}`).fetchSockets();
+    return sockets.some((userSocket) =&gt; userSocket.id !== currentSocketId);
+  }
+
+  function leaveAuthenticatedRooms(socket) {
+    for (const room of socket.rooms) {
+      if (
+        room !== socket.id &amp;&amp;
+        (room.startsWith(&quot;user_&quot;) || room.startsWith(&quot;chat_&quot;))
+      ) {
+        socket.leave(room);
+      }
+    }
+  }
+
+  async function markUserOffline(userUuid, lastSeen) {
+    await UserStatus.update(
+      {
+        isOnline: false,
+        lastSeen,
+        socketId: null,
+      },
+      { where: { userUuid } },
+    );
+
+    io.emit(&quot;user_status_change&quot;, {
+      userUuid,
+      isOnline: false,
+      lastSeen,
+    });
+  }
+
+  app.use(express.json({ limit: &quot;50mb&quot; }));
+  app.use(express.urlencoded({ extended: true, limit: &quot;50mb&quot; }));
+  app.use(cors());
+
+  app.use((req, res, next) =&gt; {
+    if (path.extname(req.url) === &quot;.js&quot;) {
+      res.setHeader(&quot;Content-Type&quot;, &quot;application/javascript&quot;);
+    }
+    next();
+  });
+
+  app.use(&quot;/api&quot;, authRoutes);
+  app.use(&quot;/api&quot;, userRoutes);
+  app.use(&quot;/api&quot;, messagingRoutes);
+  app.use(&quot;/api&quot;, searchRoutes);
+  app.use(&quot;/api/music&quot;, proxyRoutes);
+
+  io.on(&quot;connection&quot;, (socket) =&gt; {
+    socket.on(&quot;authenticate&quot;, async (data) =&gt; {
+      try {
+        const { uuid, joinChatRooms = false } = data;
+        if (!uuid) return;
+
+        const previousUuid = socket.data.userUuid;
+        if (previousUuid &amp;&amp; previousUuid !== uuid) {
+          socket.data.userUuid = null;
+          socket.data.activeChat = null;
+          leaveAuthenticatedRooms(socket);
+
+          if (!(await hasOtherUserSocket(previousUuid, socket.id))) {
+            await markUserOffline(previousUuid, new Date());
+          }
+        }
+
+        await UserStatus.upsert({
+          userUuid: uuid,
+          isOnline: true,
+          lastSeen: new Date(),
+          socketId: socket.id,
+        });
+
+        socket.data.userUuid = uuid;
+        socket.data.activeChat = null;
+        socket.join(`user_${uuid}`);
+
+        if (joinChatRooms) {
+          const userChats = await ChatMember.findAll({
+            where: { userUuid: uuid },
+            attributes: [&quot;chatId&quot;],
+            raw: true,
+          });
+
+          userChats.forEach((chatMember) =&gt; {
+            socket.join(`chat_${chatMember.chatId}`);
+          });
+        }
+
+        socket.broadcast.emit(&quot;user_status_change&quot;, {
+          userUuid: uuid,
+          isOnline: true,
+        });
+      } catch (error) {
+        console.error(&quot;Error during authentication:&quot;, error);
+      }
+    });
+
+    socket.on(&quot;join_chat&quot;, (chatId) =&gt; {
+      if (!socket.data.userUuid) return;
+      socket.join(`chat_${chatId}`);
+    });
+
+    socket.on(&quot;leave_chat&quot;, (chatId) =&gt; {
+      socket.leave(`chat_${chatId}`);
+    });
+
+    socket.on(&quot;viewing_chat&quot;, (chatId) =&gt; {
+      if (!socket.data.userUuid) return;
+      socket.data.activeChat = chatId;
+    });
+
+    socket.on(&quot;stop_viewing_chat&quot;, () =&gt; {
+      socket.data.activeChat = null;
+    });
+
+    socket.on(&quot;send_message&quot;, async (data) =&gt; {
+      try {
+        const { chatId, content, senderUuid, senderUsername, isSystem } = data;
+
+        const authenticatedUuid = socket.data.userUuid;
+        if (authenticatedUuid !== senderUuid &amp;&amp; !isSystem) {
+          return socket.emit(&quot;error&quot;, &quot;Authentication mismatch&quot;);
+        }
+
+        const finalSenderUsername = senderUsername || &quot;Unknown User&quot;;
+
+        socket.to(`chat_${chatId}`).emit(&quot;new_message&quot;, {
+          chatId,
+          content,
+          senderUuid,
+          senderUsername: finalSenderUsername,
+          timestamp: new Date(),
+          isSystem: isSystem || false,
+        });
+
+        // lastActivity is already updated by the REST call that stored the message
+        const chatMembers = await ChatMember.findAll({
+          where: { chatId },
+          attributes: [&quot;userUuid&quot;],
+          raw: true,
+        });
+
+        await Promise.all(
+          chatMembers
+            .filter((member) =&gt; member.userUuid !== senderUuid)
+            .map(async (member) =&gt; {
+              const userSockets = await io
+                .in(`user_${member.userUuid}`)
+                .fetchSockets();
+
+              const isCurrentlyViewing = userSockets.some(
+                (userSocket) =&gt;
+                  String(userSocket.data.activeChat) === String(chatId),
+              );
+
+              if (!isCurrentlyViewing) {
+                socket
+                  .to(`user_${member.userUuid}`)
+                  .emit(&quot;new_message_notification&quot;, {
+                    chatId,
+                    content,
+                    senderUuid,
+                    senderUsername: finalSenderUsername,
+                    timestamp: new Date(),
+                    isSystem: isSystem || false,
+                  });
+              }
+            }),
+        );
+      } catch (error) {
+        console.error(&quot;Error handling message:&quot;, error);
+        socket.emit(&quot;error&quot;, &quot;Failed to send message&quot;);
+      }
+    });
+
+    socket.on(&quot;typing_start&quot;, (data) =&gt; {
+      const { chatId, senderUuid } = data;
+      socket.to(`chat_${chatId}`).emit(&quot;user_typing&quot;, {
+        chatId,
+        userUuid: senderUuid,
+        isTyping: true,
+      });
+    });
+
+    socket.on(&quot;typing_stop&quot;, (data) =&gt; {
+      const { chatId, senderUuid } = data;
+      socket.to(`chat_${chatId}`).emit(&quot;user_typing&quot;, {
+        chatId,
+        userUuid: senderUuid,
+        isTyping: false,
+      });
+    });
+
+    socket.on(&quot;mark_read&quot;, async (data) =&gt; {
+      try {
+        const { chatId } = data;
+        const userUuid = socket.data.userUuid;
+
+        if (!userUuid) return;
+
+        await ChatMember.update(
+          { lastReadAt: new Date() },
+          { where: { chatId, userUuid } },
+        );
+
+        socket.to(`chat_${chatId}`).emit(&quot;messages_read&quot;, {
+          chatId,
+          userUuid,
+          readAt: new Date(),
+        });
+      } catch (error) {
+        console.error(&quot;Error marking messages as read:&quot;, error);
+      }
+    });
+
+    socket.on(&quot;heartbeat&quot;, async (data) =&gt; {
+      try {
+        const { uuid } = data;
+        if (!uuid) return;
+        if (socket.data.userUuid !== uuid) return;
+
+        await UserStatus.upsert({
+          userUuid: uuid,
+          isOnline: true,
+          lastSeen: new Date(),
+          socketId: socket.id,
+        });
+      } catch (error) {
+        console.error(&quot;Error handling heartbeat:&quot;, error);
+      }
+    });
+
+    socket.on(&quot;disconnecting&quot;, async () =&gt; {
+      const userUuid = socket.data.userUuid;
+      socket.data.activeChat = null;
+
+      if (!userUuid || (await hasOtherUserSocket(userUuid, socket.id))) {
+        return;
+      }
+
+      const lastSeen = new Date();
+      try {
+        await markUserOffline(userUuid, lastSeen);
+      } catch (error) {
+        console.error(&quot;Error during disconnect:&quot;, error);
+      }
+    });
+  });
+
+  setInterval(async () =&gt; {
+    try {
+      // 1. Clean up stale users in database
+      const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+
+      const [, staleUsers] = await UserStatus.update(
+        { isOnline: false, socketId: null },
+        {
+          where: {
+            isOnline: true,
+            lastSeen: { [Op.lt]: thirtyMinutesAgo },
+          },
+          returning: true,
+        },
+      );
+
+      for (const user of staleUsers) {
+        io.emit(&quot;user_status_change&quot;, {
+          userUuid: user.userUuid,
+          isOnline: false,
+          lastSeen: user.lastSeen,
+        });
+      }
+    } catch (error) {
+      console.error(&quot;Error in periodic cleanup:&quot;, error);
+    }
+  }, 60000).unref?.();
+
+  app.use(express.static(path.join(__dirname, &quot;static&quot;), staticOptions));
+  app.use((req, res, next) =&gt; {
+    if (req.method === &quot;GET&quot; &amp;&amp; !path.extname(req.url)) {
+      const filePath = path.join(__dirname, &quot;static&quot;, req.url + &quot;.html&quot;);
+      res.sendFile(filePath, (err) =&gt; {
+        if (err) {
+          next();
+        }
+      });
+    } else {
+      next();
+    }
+  });
+
+  const routes = [
+    { path: &quot;/a&quot;, file: &quot;apps.html&quot; },
+    { path: &quot;/g&quot;, file: &quot;games.html&quot; },
+    { path: &quot;/s&quot;, file: &quot;settings.html&quot; },
+    { path: &quot;/b&quot;, file: &quot;browser.html&quot; },
+    { path: &quot;/&quot;, file: &quot;index.html&quot; },
+    { path: &quot;/d&quot;, file: &quot;dashboard.html&quot; },
+    { path: &quot;/-&quot;, file: &quot;media.html&quot; },
+    { path: &quot;/m&quot;, file: &quot;media.html&quot; },
+    { path: &quot;/profile&quot;, file: &quot;account.html&quot; },
+    { path: &quot;/login&quot;, file: &quot;login.html&quot; },
+    { path: &quot;/signup&quot;, file: &quot;signup.html&quot; },
+    { path: &quot;/l&quot;, file: &quot;/assets/404/loading.html&quot; },
+    { path: &quot;/c&quot;, file: &quot;chat.html&quot; },
+    { path: &quot;/chat&quot;, file: &quot;chat.html&quot; },
+  ];
+
+  // Old address of the browser page; keep existing bookmarks working.
+  app.get(&quot;/!&quot;, (req, res) =&gt; res.redirect(&quot;/b&quot;));
+
+  routes.forEach((route) =&gt; {
+    app.get(route.path, (req, res) =&gt; {
+      res.sendFile(path.join(__dirname, &quot;static&quot;, route.file));
+    });
+  });
+
+  app.get(&quot;/chat/:chatId&quot;, (req, res) =&gt; {
+    res.sendFile(path.join(__dirname, &quot;static&quot;, &quot;chat.html&quot;));
+  });
+
+  app.use((req, res) =&gt; {
+    const notFoundPage = path.join(__dirname, &quot;static&quot;, &quot;404.html&quot;);
+    res.status(404).sendFile(notFoundPage);
+  });
+
+  server.removeAllListeners(&quot;upgrade&quot;);
+
+  const upgradedSockets = new Set();
+
+  server.on(&quot;upgrade&quot;, (req, socket, head) =&gt; {
+    upgradedSockets.add(socket);
+    socket.once(&quot;close&quot;, () =&gt; upgradedSockets.delete(socket));
+    if (req.url.startsWith(&quot;/api/live/&quot;) || req.url.startsWith(&quot;/wisp/&quot;)) {
+      wisp.routeRequest(req, socket, head);
+    } else {
+      io.engine.handleUpgrade(req, socket, head);
+    }
+  });
+
+  server.on(&quot;listening&quot;, () =&gt; {
+    console.log(`\n------------------------------------`);
+    console.log(`🔗 URL: http://localhost:${process.env.PORT}`);
+    console.log(`------------------------------------\n`);
+  });
+
+  let shuttingDown = false;
+
+  function shutdown(signal) {
+    if (shuttingDown) {
+      console.log(&quot;  Forcing exit.&quot;);
+      process.exit(1);
+    }
+    shuttingDown = true;
+
+    console.log(&quot;-----------------------------------------------&quot;);
+    console.log(`  Shutting Down (Signal: ${signal})  `);
+    console.log(&quot;-----------------------------------------------\n&quot;);
+
+    // Don&#x27;t hang forever if something refuses to close.
+    setTimeout(() =&gt; {
+      console.error(&quot;  Shutdown timed out, forcing exit.&quot;);
+      process.exit(1);
+    }, 5000).unref();
+
+    server.close(async () =&gt; {
+      console.log(&quot;  55GMS has shut down.&quot;);
+      await Promise.allSettled([
+        redisPubClient?.quit(),
+        redisSubClient?.quit(),
+      ]);
+      process.exit(0);
+    });
+
+    // server.close() waits for open connections; end them so it can finish.
+    io.close();
+    for (const socket of upgradedSockets) socket.destroy();
+    server.closeAllConnections();
+  }
+
+  process.on(&quot;SIGTERM&quot;, () =&gt; shutdown(&quot;SIGTERM&quot;));
+  process.on(&quot;SIGINT&quot;, () =&gt; shutdown(&quot;SIGINT&quot;));
+
+  Promise.all([initDatabase(), configureSocketAdapter()])
+    .then(() =&gt; {
+      startMessageRetention();
+      server.listen({
+        port: process.env.PORT || 8080,
+      });
+    })
+    .catch((error) =&gt; {
+      console.error(&quot;Failed to initialize server dependencies:&quot;, error);
+      process.exit(1);
+    });
+
+  server.on(&quot;error&quot;, (error) =&gt; {
+    console.error(&quot;Server error:&quot;, error);
+  });
+} catch (e) {
+  console.error(&quot;Failed to start server:&quot;, e);
+  process.exit(1);
+}
+</code></pre>
+</body>
+</html>
